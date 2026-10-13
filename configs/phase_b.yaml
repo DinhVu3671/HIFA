@@ -1,0 +1,71 @@
+phase: B
+
+# Giai đoạn B (mở rộng) — THỊ TRƯỜNG MỸ, 16 mã (8 mã GĐ0 + 8 mã mới).
+data:
+  market: "US"
+  source: "yfinance"
+  tickers: ["AAPL", "MSFT", "JPM", "JNJ", "XOM", "PG", "KO", "NVDA",
+            "GOOGL", "AMZN", "V", "HD", "DIS", "CSCO", "MRK", "CVX"]
+  start_date: "2015-01-01"
+  end_date: "2025-12-31"
+  raw_ohlcv_path: "data/raw/ohlcv/phase_b.parquet"
+  processed_path: "data/processed/phase_b.parquet"
+  walk_forward:
+    train_years: 3
+    val_months: 6
+    test_months: 6
+    step_months: 6
+
+env:
+  initial_cash: 1_000_000        # USD
+  transaction_cost: 0.0005       # 0.05%/lệnh (broker Mỹ)
+  price_limit: null              # Mỹ không có biên độ giá
+  max_weight: 0.30               # trần 30%/mã (De-Cuong §6.2)
+  reward:
+    alpha: 0.5
+    beta: 0.3
+    gamma: 0.2
+    window: 20
+
+agents:
+  base_model_name: "Qwen/Qwen2.5-1.5B-Instruct"   # có thể nâng lên Qwen2.5-7B-Instruct nếu đủ GPU
+  types: ["fundamental", "technical", "sentiment"]
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+  max_prompt_length: 512
+
+meta_agent:
+  n_sources: 3
+  hidden: 32
+
+training:
+  stage1_base_agents:
+    n_steps: 512
+    n_epochs: 4
+    batch_size: 64
+    lr: 1.0e-5
+  stage2_meta:
+    lr: 1.0e-3
+    epochs: 50
+  stage3_super_agent:
+    n_steps: 512
+    n_epochs: 4
+    batch_size: 64
+    lr: 1.0e-5
+  seeds_ablation: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+baselines:
+  b5_flag_trader_single_block: true   # tái sử dụng PortfolioPolicyLLM Giai đoạn A trên 10 mã
+  b6_frozen_extractor:
+    base_model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+
+logging:
+  wandb_project: "hifa-phase-b"
+  tensorboard_dir: "./logs"
+
+evaluation:
+  n_seeds: 10
+  output_dir: "reports/phase_b"

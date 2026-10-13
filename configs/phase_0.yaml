@@ -1,0 +1,76 @@
+phase: "0"
+
+# Giai đoạn 0 — Đánh giá kiến trúc nền A1/B1/C1 trên THỊ TRƯỜNG MỸ.
+# Theo đề cương De-Cuong.md (§6.4) và Implementation Plan §0.1.
+# Dataset dùng chung với Giai đoạn A (không đổi giữa 2 giai đoạn) để số liệu
+# A1/B1/C1 làm mốc so sánh trực tiếp cho HIFA.
+
+data:
+  market: "US"
+  source: "yfinance"
+  tickers: ["AAPL", "MSFT", "JPM", "JNJ", "XOM", "PG", "KO", "NVDA"]
+  benchmark:
+    dow: "^DJI"
+    nasdaq100: "^NDX"
+  start_date: "2015-01-01"
+  end_date: "2025-12-31"
+  raw_ohlcv_path: "data/raw/ohlcv/phase_0.parquet"
+  processed_path: "data/processed/phase_0.parquet"
+  # 1 cửa sổ duy nhất (ưu tiên tốc độ chạy nhiều kiến trúc/nhiều seed).
+  walk_forward:
+    train_range: ["2019-01-01", "2022-12-31"]
+    val_range: ["2023-01-01", "2023-06-30"]
+    test_range: ["2023-07-01", "2023-12-31"]
+
+env:
+  # Thị trường Mỹ: KHÔNG có biên độ giá (price_limit=null), có trần 30%/mã.
+  initial_cash: 1_000_000        # USD
+  transaction_cost: 0.0005       # 0.05%/lệnh (dải 0.05–0.1% broker Mỹ); grid-search nếu cần
+  price_limit: null              # Mỹ không có biên độ giá hằng ngày
+  max_weight: 0.30               # trần 30%/mã (De-Cuong §6.2)
+  reward:
+    # PLACEHOLDER — phải grid-search trên tập val (De-Cuong §7.5), không gán cố định cho kết quả cuối.
+    alpha: 0.5   # trọng số net_return
+    beta: 0.3    # trọng số sharpe_local
+    gamma: 0.2   # trọng số drawdown penalty
+    window: 20
+
+model:
+  # Base LLM cho A1 (FLAG-Trader-style) — MVP dùng model nhỏ open-weight.
+  base_model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+  max_prompt_length: 512
+
+training:
+  n_steps: 512
+  n_epochs: 4
+  batch_size: 64
+  lr: 1.0e-5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  total_updates: 200
+  seeds: [0, 1, 2, 3, 4]          # tối thiểu 5 seed cho Chương 6
+  gradient_checkpointing: true
+
+baselines:
+  b4_ppo_no_llm:
+    total_timesteps: 200_000
+
+architectures:
+  # Thứ tự ưu tiên cài đặt theo De-Cuong §6.4.2.
+  priority: ["B1_harlf", "A1_flag", "C1_debate"]
+
+logging:
+  wandb_project: "hifa-us-phase-0"
+  tensorboard_dir: "./logs"
+
+evaluation:
+  n_seeds: 5
+  output_dir: "reports/phase_0"
+  # Metric bổ sung riêng cho Chương 6 (De-Cuong §6.4.4).
+  extra_metrics: ["policy_collapse_rate", "wall_clock_per_seed"]

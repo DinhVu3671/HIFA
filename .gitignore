@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# Dữ liệu & artifact nặng (fetch lại trên Colab bằng yfinance; không đẩy lên git)
+data/raw/
+data/processed/
+data/splits/
+checkpoints/
+logs/
+reports/
+*.parquet
+*.zip
+
+# wandb
+wandb/
+
+# OS / editor
+.DS_Store
+.ipynb_checkpoints/
+*.tmp
