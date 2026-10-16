@@ -462,11 +462,11 @@ class MetaScoreObsWrapper(gym.Wrapper):
 
         per_ticker = np.stack(
             [
-                meta_score.squeeze(-1).numpy(),
-                fund_scores.numpy(),
-                tech_scores.numpy(),
-                sent_scores.numpy(),
-                avg_confidence.numpy(),
+                meta_score.squeeze(-1).detach().cpu().numpy(),
+                fund_scores.detach().cpu().numpy(),
+                tech_scores.detach().cpu().numpy(),
+                sent_scores.detach().cpu().numpy(),
+                avg_confidence.detach().cpu().numpy(),
             ],
             axis=-1,
         )  # (n_tickers, 5) -- layout tương thích obs_array_to_dict(), xem docstring class

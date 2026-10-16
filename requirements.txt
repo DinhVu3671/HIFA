@@ -6,7 +6,6 @@ accelerate>=0.33
 gymnasium>=0.29
 stable-baselines3>=2.3
 yfinance>=1.5
-pandas-ta
 quantstats
 wandb
 requests

@@ -86,8 +86,8 @@ def main() -> None:
         weights, value = policy([dummy_prompt])
     t_fwd = time.perf_counter() - t0
     log(f"forward() 1 prompt: {t_fwd:.2f}s | weights.shape={tuple(weights.shape)} value.shape={tuple(value.shape)}")
-    log(f"weights={weights.detach().numpy().tolist()} sum={float(weights.sum()):.6f}")
-    log(f"value={value.detach().numpy().tolist()}")
+    log(f"weights={weights.detach().cpu().numpy().tolist()} sum={float(weights.sum()):.6f}")
+    log(f"value={value.detach().cpu().numpy().tolist()}")
     assert weights.shape == (1, len(TICKERS) + 1), f"weights shape sai: {weights.shape}"
     assert value.shape == (1, 1), f"value shape sai: {value.shape}"
     assert torch.isfinite(weights).all(), "weights co NaN/Inf!"

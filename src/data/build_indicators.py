@@ -2,7 +2,25 @@
 src/data/build_indicators.py
 ------------------------------
 Bước 2 (mục 3.2 đặc tả HIFA) — tính chỉ báo kỹ thuật (RSI14, MACD,
-Bollinger Bands, volatility 20 ngày) bằng `pandas_ta`.
+Bollinger Bands, volatility 20 ngày) bằng PANDAS THUẦN (không phụ thuộc
+`pandas_ta`).
+
+Vì sao bỏ `pandas_ta`?
+    `pandas_ta==0.3.14b0` (bản mới nhất trên PyPI) không build được với
+    `pip>=24.1` (lỗi `setup.py egg_info`) và chưa tương thích numpy>=2.0 /
+    pandas 3.x. Trên Colab (pip/pandas luôn mới) việc ghim ngược phiên bản rất
+    chậm và dễ gãy. 3 chỉ báo dự án dùng (RSI, MACD, Bollinger) đều tính được
+    bằng pandas trong vài dòng, nên ta tự implement để chạy trên MỌI phiên bản
+    pandas/numpy mới nhất mà KHÔNG đổi tên cột output hay ý nghĩa chỉ báo.
+
+Công thức khớp với mặc định pandas_ta để số liệu nhất quán với kết quả đã
+chạy trước đó:
+    - RSI(14): Wilder's smoothing — EMA với alpha = 1/length (adjust=False).
+    - MACD(12, 26, 9): EMA(12) - EMA(26); signal = EMA(9) của MACD; EMA
+      dùng adjust=False (giống pandas_ta).
+    - Bollinger(length=20, std=2.0): SMA(20) ± 2 * rolling std(ddof=0)
+      (pandas_ta dùng độ lệch chuẩn population, ddof=0).
+    - volatility_20d: rolling std(20) của pct_change() (giữ nguyên như cũ).
 
 ⚠️ CẢNH BÁO QUAN TRỌNG (đã nêu rõ trong đặc tả): các chỉ báo dùng rolling
 window (RSI, MACD, Bollinger Bands, volatility) chỉ nhìn về quá khứ nên bản
@@ -27,17 +45,6 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Compatibility shim: các bản pandas_ta cũ (<=0.3.14b, chưa có release mới hỗ
-# trợ numpy>=2.0) import `numpy.NaN` (viết hoa) — alias này đã bị xoá khỏi
-# numpy>=2.0 (chỉ còn `numpy.nan`). Patch lại TRƯỚC khi import pandas_ta để
-# tránh AttributeError khi import.
-# ---------------------------------------------------------------------------
-if not hasattr(np, "NaN"):
-    np.NaN = np.nan  # type: ignore[attr-defined]
-
-import pandas_ta as ta  # noqa: E402  (phải import sau shim ở trên)
-
 EXPECTED_INDICATOR_COLUMNS: List[str] = [
     "rsi_14",
     "macd",
@@ -48,17 +55,51 @@ EXPECTED_INDICATOR_COLUMNS: List[str] = [
 ]
 
 
-def _first_col_startswith(frame: pd.DataFrame, prefix: str) -> str:
-    """Tìm tên cột đầu tiên bắt đầu bằng `prefix`.
+# ---------------------------------------------------------------------------
+# Các chỉ báo thuần pandas (thay cho pandas_ta)
+# ---------------------------------------------------------------------------
+def _rsi(close: pd.Series, length: int = 14) -> pd.Series:
+    """RSI theo Wilder (khớp mặc định pandas_ta.rsi).
 
-    pandas_ta đặt tên cột output kèm theo tham số (vd "BBU_20_2.0"), và cách
-    format số thập phân có thể khác nhau giữa các phiên bản pandas_ta
-    (vd "2.0" vs "2"). Dò theo prefix để không phụ thuộc cứng vào phiên bản.
+    Wilder's smoothing tương đương EMA với alpha = 1/length, adjust=False.
+    `min_periods=length` để các dòng warm-up đầu chuỗi là NaN (sau đó bị
+    dropna() ở add_indicators) — giữ đúng hành vi của pandas_ta.
     """
-    candidates = [c for c in frame.columns if c.startswith(prefix)]
-    if not candidates:
-        raise KeyError(f"Không tìm thấy cột nào bắt đầu bằng '{prefix}' trong {list(frame.columns)}")
-    return candidates[0]
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    # avg_loss == 0 -> rs = inf -> rsi = 100 (toàn bộ kỳ tăng giá). Dùng 100.0.
+    rsi = rsi.where(avg_loss != 0.0, 100.0)
+    return rsi
+
+
+def _macd(
+    close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9
+) -> pd.DataFrame:
+    """MACD line + signal line (khớp mặc định pandas_ta.macd, adjust=False)."""
+    ema_fast = close.ewm(span=fast, adjust=False, min_periods=fast).mean()
+    ema_slow = close.ewm(span=slow, adjust=False, min_periods=slow).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False, min_periods=signal).mean()
+    return pd.DataFrame({"macd": macd_line, "macd_signal": signal_line})
+
+
+def _bbands(
+    close: pd.Series, length: int = 20, n_std: float = 2.0
+) -> pd.DataFrame:
+    """Bollinger Bands upper/lower (khớp mặc định pandas_ta.bbands).
+
+    pandas_ta dùng độ lệch chuẩn population (ddof=0).
+    """
+    mid = close.rolling(window=length, min_periods=length).mean()
+    std = close.rolling(window=length, min_periods=length).std(ddof=0)
+    upper = mid + n_std * std
+    lower = mid - n_std * std
+    return pd.DataFrame({"bb_upper": upper, "bb_lower": lower})
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -92,19 +133,15 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.sort_values("date").reset_index(drop=True).copy()
 
-    df["rsi_14"] = ta.rsi(df["close"], length=14)
+    df["rsi_14"] = _rsi(df["close"], length=14)
 
-    macd = ta.macd(df["close"])
-    macd_col = _first_col_startswith(macd, "MACD_")
-    macds_col = _first_col_startswith(macd, "MACDs_")
-    df["macd"] = macd[macd_col]
-    df["macd_signal"] = macd[macds_col]
+    macd = _macd(df["close"], fast=12, slow=26, signal=9)
+    df["macd"] = macd["macd"]
+    df["macd_signal"] = macd["macd_signal"]
 
-    bb = ta.bbands(df["close"], length=20)
-    bbu_col = _first_col_startswith(bb, "BBU_")
-    bbl_col = _first_col_startswith(bb, "BBL_")
-    df["bb_upper"] = bb[bbu_col]
-    df["bb_lower"] = bb[bbl_col]
+    bb = _bbands(df["close"], length=20, n_std=2.0)
+    df["bb_upper"] = bb["bb_upper"]
+    df["bb_lower"] = bb["bb_lower"]
 
     df["volatility_20d"] = df["close"].pct_change().rolling(20).std()
 
