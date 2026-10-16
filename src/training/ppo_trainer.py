@@ -366,6 +366,16 @@ class SimplePPOTrainer:
                 # Gradient BẬT ở đây (khác hẳn collect_rollout dùng no_grad).
                 weights, values_pred = self.policy(batch_prompts)
                 dist = _weights_to_dirichlet(weights, self.dirichlet_concentration_scale)
+
+                # Rollout buffer giữ tensor trên CPU, còn policy chạy trên GPU khi
+                # có CUDA -> phải đưa các batch tensor về đúng device của output
+                # policy trước khi dùng, tránh "tensors on different devices".
+                policy_device = weights.device
+                batch_actions = batch_actions.to(policy_device)
+                batch_old_log_probs = batch_old_log_probs.to(policy_device)
+                batch_advantages = batch_advantages.to(policy_device)
+                batch_returns = batch_returns.to(policy_device)
+
                 new_log_probs = dist.log_prob(batch_actions)
                 entropy = dist.entropy().mean()
 

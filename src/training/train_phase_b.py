@@ -50,6 +50,17 @@ from src.data.build_dataset import load_state_dataframe
 _NO_NEWS_TEXT = "No recent news."
 
 
+def _module_device(module: nn.Module) -> torch.device:
+    """Device của tham số đầu tiên trong `module` (CPU nếu module không có
+    tham số). Dùng để tạo các tensor phụ trợ (target, next_returns, ...) trên
+    ĐÚNG device của model — tránh "tensors on different devices" khi chạy GPU
+    (BaseAgent/PortfolioPolicyLLM tự chuyển lên CUDA trong __init__)."""
+    try:
+        return next(module.parameters()).device
+    except StopIteration:  # pragma: no cover - module không có param
+        return torch.device("cpu")
+
+
 def _attach_placeholder_news(state_df, tickers, text: str = _NO_NEWS_TEXT):
     """Gắn cột (ticker, 'recent_news') = placeholder cho mọi ngày.
 
@@ -185,6 +196,7 @@ def train_base_agent(
         raise ValueError("state_df cần tối thiểu 2 ngày để tính next-day-return.")
 
     agent = BaseAgent(base_model_name, agent_type)
+    device = _module_device(agent)
     trainable_params = [p for p in agent.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=lr)
 
@@ -202,8 +214,10 @@ def train_base_agent(
                 build_prompt_for_agent(agent_type, _extract_ticker_data(row, tk, agent_type))
                 for tk in tickers
             ]
+            # Tạo trên ĐÚNG device của agent — score/value đến từ agent có thể
+            # ở GPU, nếu next_returns/target ở CPU sẽ nổ device mismatch.
             next_returns = torch.tensor(
-                _next_day_returns(row, next_row, tickers), dtype=torch.float32
+                _next_day_returns(row, next_row, tickers), dtype=torch.float32, device=device
             ).unsqueeze(-1)  # (n_tickers, 1)
             target = torch.tanh(next_returns / return_scale)
 
@@ -301,10 +315,14 @@ def train_meta_aggregator(
         for name in order:
             scores_per_type[name] = torch.stack(scores_per_type[name], dim=0)  # (n_dates, n_tickers)
 
+    # Device của scores precompute (base agent có thể đã ở GPU) — MetaAggregator
+    # và mọi tensor target phải cùng device này để tránh device mismatch.
+    device = scores_per_type[order[0]].device
+
     # confidence động = compute_confidence(độ lệch chuẩn rolling của chính
     # score nguồn đó qua `vol_window` ngày gần nhất) — "nguồn càng ổn định
     # càng tin cậy", đúng docstring MetaAggregator.compute_confidence().
-    meta = MetaAggregator(n_sources=n_sources, hidden=hidden)
+    meta = MetaAggregator(n_sources=n_sources, hidden=hidden).to(device)
     confidences_per_type: Dict[str, torch.Tensor] = {}
     for name in order:
         scores = scores_per_type[name]
@@ -329,7 +347,7 @@ def train_meta_aggregator(
             conf_t = torch.stack([confidences_per_type[name][t] for name in order], dim=-1)
 
             next_returns = torch.tensor(
-                _next_day_returns(row, next_row, tickers), dtype=torch.float32
+                _next_day_returns(row, next_row, tickers), dtype=torch.float32, device=device
             ).unsqueeze(-1)
             target = torch.tanh(next_returns / return_scale)
 
@@ -453,9 +471,11 @@ class MetaScoreObsWrapper(gym.Wrapper):
             # tương tác tuần tự, không có sẵn lịch sử score đã precompute.
             source_vol = base_scores.std(dim=0, unbiased=False)  # (3,)
             conf_values = [self.meta_aggregator.compute_confidence(float(v.item())) for v in source_vol]
-            confidences = torch.tensor(conf_values, dtype=torch.float32).unsqueeze(0).expand(
-                self.n_tickers, -1
-            )
+            # Cùng device với base_scores (agent có thể ở GPU) để meta_aggregator
+            # forward không nổ device mismatch khi torch.cat(scores, confidences).
+            confidences = torch.tensor(
+                conf_values, dtype=torch.float32, device=base_scores.device
+            ).unsqueeze(0).expand(self.n_tickers, -1)
             avg_confidence = confidences.mean(dim=-1)  # (n_tickers,)
 
             meta_score, _ = self.meta_aggregator(base_scores, confidences)  # (n_tickers, 1)
