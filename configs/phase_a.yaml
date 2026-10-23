@@ -45,6 +45,11 @@ training:
   total_updates: 200
   seeds: [0, 1, 2, 3, 4]
   gradient_checkpointing: true
+  save_every: 10   # lưu checkpoint resume mỗi 10 update (~13 phút) — chống mất tiến độ khi Colab ngắt
+  # --- Ổn định PPO (fix approx_kl/clip_frac cao) ---
+  dirichlet_concentration_scale: 10.0  # giảm từ 50 -> log_prob bớt nhạy, ratio ổn định hơn
+  entropy_coef: 0.01                   # hệ số entropy bonus (khuyến khích exploration)
+  target_kl: 0.05                      # KL early-stop: dừng epoch khi policy trôi quá xa (null = tắt)
 
 baselines:
   b4_ppo_no_llm:

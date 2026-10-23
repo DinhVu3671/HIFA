@@ -145,6 +145,63 @@ def trainable_state_dict(policy: torch.nn.Module) -> Dict[str, torch.Tensor]:
     return {k: v for k, v in full_state.items() if k in trainable_names}
 
 
+def save_checkpoint(
+    ckpt_path: Path,
+    policy: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    seed: int,
+    next_update: int,
+    total_updates: int,
+    n_trainable: int,
+    history: List[Dict[str, float]],
+    cfg: Dict[str, Any],
+) -> None:
+    """Lưu checkpoint ĐẦY ĐỦ để resume: trainable weights + optimizer state +
+    vị trí update đang dở (`next_update`) + lịch sử train. Ghi ra file tạm rồi
+    `os.replace` (atomic) để KHÔNG bao giờ để lại checkpoint hỏng nếu Colab bị
+    ngắt ngay giữa lúc đang ghi."""
+    tmp_path = ckpt_path.with_suffix(ckpt_path.suffix + ".tmp")
+    torch.save(
+        {
+            "trainable_state_dict": trainable_state_dict(policy),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "seed": seed,
+            "next_update": next_update,
+            "total_updates": total_updates,
+            "n_trainable_params": n_trainable,
+            "history": history,
+            "config": cfg,
+        },
+        tmp_path,
+    )
+    os.replace(tmp_path, ckpt_path)
+
+
+def load_checkpoint_if_any(
+    ckpt_path: Path,
+    policy: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> Optional[Dict[str, Any]]:
+    """Nạp lại checkpoint dở (nếu có) vào `policy` + `optimizer`. Trả về dict
+    metadata (`next_update`, `history`, ...) hoặc None nếu chưa có checkpoint.
+
+    Dùng `strict=False` vì checkpoint CHỈ chứa param trainable (LoRA + 2 head),
+    backbone frozen đã được nạp lại từ `base_model_name` lúc khởi tạo policy."""
+    if not ckpt_path.exists():
+        return None
+    device = next((p.device for p in policy.parameters()), torch.device("cpu"))
+    ckpt = torch.load(ckpt_path, map_location=device)
+    missing, unexpected = policy.load_state_dict(ckpt["trainable_state_dict"], strict=False)
+    if unexpected:
+        logger.warning("Checkpoint có %d key không khớp policy (bỏ qua): %s", len(unexpected), unexpected[:5])
+    try:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Không nạp được optimizer state (%s) — optimizer khởi tạo lại từ đầu.", exc)
+    return ckpt
+
+
 def try_init_wandb(cfg: Dict[str, Any], run_name: str):
     """wandb OPTIONAL (xem docstring module). Trả về module `wandb` đã init
     thành công, hoặc None nếu không dùng được vì BẤT KỲ lý do gì."""
@@ -204,7 +261,7 @@ def try_init_tensorboard(cfg: Dict[str, Any], run_name: str):
 # ---------------------------------------------------------------------------
 # Vòng lặp train 1 seed
 # ---------------------------------------------------------------------------
-def run_one_seed(cfg: Dict[str, Any], seed: int, smoke_test: bool) -> Path:
+def run_one_seed(cfg: Dict[str, Any], seed: int, smoke_test: bool, resume: bool = True) -> Path:
     if PortfolioEnvPhaseA is None:
         raise ImportError(
             "Không import được `src.envs.portfolio_env.PortfolioEnvPhaseA` "
@@ -229,6 +286,9 @@ def run_one_seed(cfg: Dict[str, Any], seed: int, smoke_test: bool) -> Path:
         initial_cash=env_cfg["initial_cash"],
         transaction_cost=env_cfg["transaction_cost"],
         price_limit=env_cfg["price_limit"],
+        # Trần tỷ trọng mỗi mã (De-Cuong §6.2) — PHẢI truyền để train áp đúng
+        # ràng buộc 30%/mã; nếu bỏ qua, agent có thể all-in 1 mã, lệch đề cương.
+        max_weight=env_cfg.get("max_weight"),
     )
 
     model_cfg = cfg["model"]
@@ -274,6 +334,9 @@ def run_one_seed(cfg: Dict[str, Any], seed: int, smoke_test: bool) -> Path:
         gae_lambda=train_cfg.get("gae_lambda", 0.95),
         n_steps=n_steps,
         gradient_checkpointing=train_cfg.get("gradient_checkpointing", True),
+        dirichlet_concentration_scale=train_cfg.get("dirichlet_concentration_scale", 10.0),
+        entropy_coef=train_cfg.get("entropy_coef", 0.01),
+        target_kl=train_cfg.get("target_kl", 0.05),
     )
 
     wandb_mod = None if smoke_test else try_init_wandb(cfg, run_name)
@@ -282,9 +345,38 @@ def run_one_seed(cfg: Dict[str, Any], seed: int, smoke_test: bool) -> Path:
     ckpt_dir = resolve_path("checkpoints/phase_a") / f"seed_{seed}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    # Checkpoint "đang chạy" (resume được) khác với checkpoint "hoàn tất" cuối.
+    resume_ckpt_path = ckpt_dir / "resume.pt"
+    final_ckpt_path = ckpt_dir / "policy_trainable.pt"
+
+    # Lưu định kỳ mỗi `save_every` update để không mất quá nhiều tiến độ nếu
+    # Colab ngắt phiên. Smoke-test không cần (chỉ 1 update).
+    save_every = 1 if smoke_test else int(train_cfg.get("save_every", 10))
+
     history: List[Dict[str, float]] = []
+    start_update = 0
+
+    if resume and not smoke_test:
+        meta = load_checkpoint_if_any(resume_ckpt_path, policy, trainer.optimizer)
+        if meta is not None:
+            start_update = int(meta.get("next_update", 0))
+            history = list(meta.get("history", []))
+            if start_update >= total_updates:
+                logger.info(
+                    "Seed %d đã train đủ %d update (resume.pt). Bỏ qua, chỉ ghi checkpoint cuối.",
+                    seed,
+                    total_updates,
+                )
+            else:
+                logger.info(
+                    "Seed %d: RESUME từ update %d/%d (nạp lại trainable weights + optimizer).",
+                    seed,
+                    start_update,
+                    total_updates,
+                )
+
     try:
-        for update_idx in range(total_updates):
+        for update_idx in range(start_update, total_updates):
             t0 = time.perf_counter()
             stats = trainer.train_step(n_steps=n_steps, n_epochs=n_epochs, batch_size=batch_size)
             stats["update"] = float(update_idx)
@@ -293,7 +385,7 @@ def run_one_seed(cfg: Dict[str, Any], seed: int, smoke_test: bool) -> Path:
 
             logger.info(
                 "[seed=%d update=%d/%d] reward=%.5f policy_loss=%.5f value_loss=%.5f "
-                "entropy=%.5f approx_kl=%.5f clip_frac=%.3f rollout=%.1fs total=%.1fs",
+                "entropy=%.5f approx_kl=%.5f clip_frac=%.3f kl_stop_ep=%.0f rollout=%.1fs total=%.1fs",
                 seed,
                 update_idx + 1,
                 total_updates,
@@ -303,6 +395,7 @@ def run_one_seed(cfg: Dict[str, Any], seed: int, smoke_test: bool) -> Path:
                 stats["entropy"],
                 stats["approx_kl"],
                 stats["clip_frac"],
+                stats.get("kl_early_stop_epoch", 0.0),
                 stats["rollout_seconds"],
                 stats["wall_seconds"],
             )
@@ -313,13 +406,35 @@ def run_one_seed(cfg: Dict[str, Any], seed: int, smoke_test: bool) -> Path:
                         tb_writer.add_scalar(f"phase_a/{k}", v, update_idx)
             if wandb_mod is not None:
                 wandb_mod.log(stats, step=update_idx)
+
+            # Lưu checkpoint resume định kỳ (và luôn ở update cuối). `next_update`
+            # = update_idx + 1 vì update này đã xong -> lần resume sẽ bắt đầu từ đó.
+            is_last = update_idx == total_updates - 1
+            if (update_idx + 1) % save_every == 0 or is_last:
+                save_checkpoint(
+                    resume_ckpt_path,
+                    policy,
+                    trainer.optimizer,
+                    seed=seed,
+                    next_update=update_idx + 1,
+                    total_updates=total_updates,
+                    n_trainable=n_trainable,
+                    history=history,
+                    cfg=cfg,
+                )
+                logger.info(
+                    "  ↳ Đã lưu checkpoint resume tại update %d/%d: %s",
+                    update_idx + 1,
+                    total_updates,
+                    resume_ckpt_path,
+                )
     finally:
         if tb_writer is not None:
             tb_writer.close()
         if wandb_mod is not None:
             wandb_mod.finish()
 
-    ckpt_path = ckpt_dir / "policy_trainable.pt"
+    # Checkpoint "hoàn tất" — nhẹ, chỉ chứa trainable weights (dùng cho evaluation).
     torch.save(
         {
             "trainable_state_dict": trainable_state_dict(policy),
@@ -327,14 +442,20 @@ def run_one_seed(cfg: Dict[str, Any], seed: int, smoke_test: bool) -> Path:
             "n_trainable_params": n_trainable,
             "config": cfg,
         },
-        ckpt_path,
+        final_ckpt_path,
     )
     history_path = ckpt_dir / "train_history.json"
     with open(history_path, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
 
-    logger.info("Seed %d xong. Checkpoint: %s | Lịch sử train: %s", seed, ckpt_path, history_path)
-    return ckpt_path
+    logger.info(
+        "Seed %d xong. Checkpoint cuối: %s | Resume: %s | Lịch sử: %s",
+        seed,
+        final_ckpt_path,
+        resume_ckpt_path,
+        history_path,
+    )
+    return final_ckpt_path
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +482,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "pipeline không lỗi runtime — KHÔNG dùng kết quả cho luận văn."
         ),
     )
+    parser.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help=(
+            "Tắt tự động resume: train lại từ đầu dù có checkpoint dở "
+            "(mặc định LUÔN resume nếu tìm thấy checkpoints/phase_a/seed_N/resume.pt)."
+        ),
+    )
+    parser.set_defaults(resume=True)
     return parser
 
 
@@ -378,11 +509,15 @@ def main(argv: Optional[List[str]] = None) -> None:
         seeds = seeds[:1]
 
     logger.info(
-        "Sẽ train %d seed(s): %s%s", len(seeds), seeds, " [SMOKE-TEST]" if args.smoke_test else ""
+        "Sẽ train %d seed(s): %s%s (resume=%s)",
+        len(seeds),
+        seeds,
+        " [SMOKE-TEST]" if args.smoke_test else "",
+        args.resume,
     )
 
     for seed in seeds:
-        run_one_seed(cfg, seed, smoke_test=args.smoke_test)
+        run_one_seed(cfg, seed, smoke_test=args.smoke_test, resume=args.resume)
 
 
 if __name__ == "__main__":

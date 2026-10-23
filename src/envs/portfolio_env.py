@@ -128,6 +128,10 @@ class PortfolioEnvPhaseA(gym.Env):
         self.cash: float = self.initial_cash
         self.weights: np.ndarray = np.zeros(self.n_assets + 1, dtype=np.float64)
         self.portfolio_value_history: List[float] = [self.initial_cash]
+        # Drawdown của bước TRƯỚC — dùng để tính *differential* drawdown
+        # (phần drawdown tăng thêm ở bước này) trong reward, thay vì drawdown
+        # tuyệt đối (luôn >= 0 nên luôn trừ, biến reward thành "thuế cố định").
+        self._prev_drawdown: float = 0.0
 
         self.reset()
 
@@ -143,6 +147,7 @@ class PortfolioEnvPhaseA(gym.Env):
         # Bắt đầu 100% tiền mặt: n_assets phần tử 0 + 1 (cash).
         self.weights = np.array([0.0] * self.n_assets + [1.0], dtype=np.float64)
         self.portfolio_value_history = [self.initial_cash]
+        self._prev_drawdown = 0.0
 
         self._base_close = {
             tk: float(self.state_df.iloc[0][(tk, "close")]) for tk in self.tickers
@@ -241,16 +246,38 @@ class PortfolioEnvPhaseA(gym.Env):
         gamma: float = 0.2,
         window: int = 20,
     ) -> float:
-        """Reward = alpha*net_return + beta*sharpe_local*0.01 - gamma*drawdown
-        - 0.001*turnover.
+        """Reward = alpha*(net_return*100) + beta*sharpe_local
+        - gamma*(delta_drawdown*100) - 0.001*turnover.
 
-        LƯU Ý: alpha/beta/gamma ở đây là placeholder ban đầu — PHẢI grid-search
-        lại trên tập validation theo đúng chỉ dẫn ở đề cương (6.5), không dùng
-        cố định cho kết quả cuối.
+        THAY ĐỔI SCALE (so với bản nháp ban đầu) — lý do & cơ sở để ghi vào
+        phần phương pháp luận văn:
 
-        Xử lý ổn định số học ở episode đầu (khi `portfolio_value_history` chưa
-        đủ `window` giá trị): nếu cửa sổ rolling có <= 2 giá trị thì
-        `sharpe_local = 0.0` (không đủ dữ liệu để ước lượng), tránh chia 0/NaN.
+        1. `net_return * 100` (quy ra PHẦN TRĂM): daily return cổ phiếu ~±1%
+           (tức ±0.01) nên ở dạng thô, số hạng lợi nhuận chỉ ~±0.005 — quá
+           nhỏ, bị các số hạng khác nhấn chìm, PPO gần như không nhận được
+           gradient "danh mục nào sinh lời hơn". Nhân 100 đưa net_return về
+           thang %-đơn-vị, tín hiệu học rõ hơn ~100 lần.
+
+        2. Bỏ hệ số `*0.01` ở sharpe: bản nháp nhân sharpe với 0.01 khiến số
+           hạng này ~±0.0001 (gần như tắt), mâu thuẫn với ý nghĩa trọng số
+           `beta=0.3`. Sharpe cục bộ thường nằm trong ~[-3, 3] nên `beta*sharpe`
+           đóng góp ~[-0.9, 0.9] — cùng thang với số hạng net_return, đúng vai
+           trò "trọng số" như tên gọi.
+
+        3. DIFFERENTIAL drawdown thay cho drawdown tuyệt đối: drawdown tuyệt
+           đối `(peak - current)/peak` LUÔN >= 0, nên `- gamma*drawdown` là một
+           "thuế cố định" luôn âm, kéo reward xuống ~-0.002..-0.005 BẤT KỂ agent
+           làm gì (đây là lý do reward bị "dính" quanh -0.003 và không cải thiện
+           trong log train). Thay bằng `delta_drawdown = drawdown_t -
+           drawdown_{t-1}`: chỉ phạt phần drawdown TĂNG THÊM ở bước này; khi
+           danh mục hồi phục (drawdown giảm) thì delta âm -> `-gamma*delta` DƯƠNG
+           (thưởng). Đây là tín hiệu "reward shaping" trung lập theo thời gian,
+           không bias về âm.
+
+        LƯU Ý: alpha/beta/gamma vẫn là placeholder — PHẢI grid-search lại trên
+        tập validation theo đề cương (6.5), không dùng cố định cho kết quả cuối.
+
+        Ổn định số học ở episode đầu (history < 3 giá trị): `sharpe_local=0.0`.
         """
         values = np.array(self.portfolio_value_history[-window:], dtype=np.float64)
 
@@ -265,10 +292,14 @@ class PortfolioEnvPhaseA(gym.Env):
             peak = values.max()
             drawdown = float((peak - values[-1]) / (peak + 1e-8))
 
+        # Differential drawdown: phần drawdown tăng thêm so với bước trước.
+        delta_drawdown = drawdown - self._prev_drawdown
+        self._prev_drawdown = drawdown
+
         reward = (
-            alpha * net_return
-            + beta * sharpe_local * 0.01
-            - gamma * drawdown
+            alpha * (net_return * 100.0)
+            + beta * sharpe_local
+            - gamma * (delta_drawdown * 100.0)
             - 0.001 * turnover
         )
         return float(reward)

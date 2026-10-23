@@ -110,6 +110,25 @@ def _weights_to_dirichlet(
     return torch.distributions.Dirichlet(concentration)
 
 
+def _set_dropout_eval(module: nn.Module) -> None:
+    """Đặt MỌI lớp Dropout (gồm cả LoRA dropout) về chế độ eval, GIỮ NGUYÊN
+    các lớp khác ở chế độ train.
+
+    LÝ DO (fix lỗi approx_kl/clip_frac cao): PPO yêu cầu log_prob của "policy
+    cũ" (tính lúc collect_rollout dưới policy.eval(), dropout TẮT) và log_prob
+    "policy mới" (tính lúc update dưới policy.train(), dropout BẬT) phải nhất
+    quán về mặt stochasticity — nếu không, ratio = exp(new - old) sẽ lệch chỉ
+    vì NHIỄU DROPOUT khác nhau giữa 2 lần forward, dù policy chưa học gì. Điều
+    này đẩy approx_kl lên hàng chục và clip_frac ~1.0 ngay từ update đầu.
+
+    Ta vẫn cần policy.train() để LoRA adapter + 2 head nhận gradient và cập
+    nhật; chỉ cần vô hiệu hoá tính ngẫu nhiên của Dropout. Gradient checkpoint
+    / BatchNorm (không dùng ở đây) không bị ảnh hưởng."""
+    for m in module.modules():
+        if isinstance(m, nn.Dropout):
+            m.eval()
+
+
 class SimplePPOTrainer:
     """PPO custom tối giản cho `PortfolioPolicyLLM`, theo khung mục 3.6 đặc tả."""
 
@@ -123,11 +142,12 @@ class SimplePPOTrainer:
         gae_lambda: float = 0.95,
         n_steps: int = 512,  # khuyến nghị 256-512 (mục 3.6), KHÔNG dùng 2048 mặc định PPO chuẩn
         tickers: Optional[Sequence[str]] = None,
-        dirichlet_concentration_scale: float = 50.0,
+        dirichlet_concentration_scale: float = 10.0,
         gradient_checkpointing: bool = True,
         value_coef: float = 0.5,
         entropy_coef: float = 0.01,
         max_grad_norm: float = 0.5,
+        target_kl: Optional[float] = 0.05,
         rollout_warn_seconds: float = 1800.0,  # 30 phút (mục 3.6)
     ) -> None:
         self.policy = policy
@@ -150,6 +170,10 @@ class SimplePPOTrainer:
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
+        # target_kl: nếu approx_kl trung bình của 1 epoch vượt ngưỡng này ->
+        # DỪNG SỚM các epoch còn lại (early stopping theo KL, thực hành chuẩn
+        # PPO) để policy không trôi quá xa "policy cũ". None = tắt early stop.
+        self.target_kl = target_kl
         self.rollout_warn_seconds = rollout_warn_seconds
 
         resolved_tickers = tickers if tickers is not None else getattr(env, "tickers", None)
@@ -348,12 +372,18 @@ class SimplePPOTrainer:
             "entropy": [],
             "approx_kl": [],
             "clip_frac": [],
+            "kl_early_stop_epoch": [],
         }
 
+        # policy.train() để LoRA + 2 head nhận gradient, NHƯNG tắt Dropout để
+        # log_prob mới nhất quán với log_prob cũ (tính lúc rollout dưới eval()).
+        # Đây là fix chính cho approx_kl/clip_frac cao bất thường.
         self.policy.train()
+        _set_dropout_eval(self.policy)
         trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
 
         for _epoch in range(n_epochs):
+            epoch_kls: List[float] = []
             perm = torch.randperm(T)
             for start in range(0, T, batch_size):
                 idx = perm[start : start + batch_size]
@@ -403,8 +433,21 @@ class SimplePPOTrainer:
                 stats["entropy"].append(float(entropy.item()))
                 stats["approx_kl"].append(approx_kl)
                 stats["clip_frac"].append(clip_frac)
+                epoch_kls.append(approx_kl)
 
-        return {k: float(np.mean(v)) for k, v in stats.items()}
+            # Early stopping theo KL: nếu KL trung bình của epoch này vượt
+            # target_kl -> dừng, không chạy các epoch còn lại (policy đã trôi
+            # đủ xa "policy cũ", update thêm chỉ gây bất ổn). approx_kl ở đây
+            # tính theo (old - new).mean() nên dùng abs() cho an toàn.
+            if self.target_kl is not None and len(epoch_kls) > 0:
+                if abs(float(np.mean(epoch_kls))) > self.target_kl:
+                    stats["kl_early_stop_epoch"].append(float(_epoch + 1))
+                    break
+
+        result = {k: float(np.mean(v)) for k, v in stats.items() if len(v) > 0}
+        # Đánh dấu không early-stop (chạy đủ n_epochs) bằng 0 để log luôn có khoá này.
+        result.setdefault("kl_early_stop_epoch", 0.0)
+        return result
 
     # ------------------------------------------------------------------
     def train_step(
