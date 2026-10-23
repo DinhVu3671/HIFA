@@ -101,12 +101,32 @@ def obs_array_to_dict(
 
 
 def _weights_to_dirichlet(
-    weights: torch.Tensor, concentration_scale: float, eps: float = 1e-4
+    weights: torch.Tensor, concentration_scale: float, floor: float = 0.02
 ) -> torch.distributions.Dirichlet:
-    """Xây phân phối Dirichlet có mean = `weights` (xem giải thích ở docstring
-    module). `eps` tránh concentration=0 khi 1 thành phần weights underflow
-    về 0 (Dirichlet yêu cầu alpha_i > 0)."""
-    concentration = weights.clamp_min(0.0) * concentration_scale + eps
+    """Xây phân phối Dirichlet có mean ≈ `weights` (xem giải thích ở docstring
+    module).
+
+    FIX approx_kl cao (quan sát thực nghiệm): softmax ở policy_head có thể tạo
+    ra vài thành phần weights CỰC NHỎ (~0.0003). Khi đó concentration của mã đó
+    = weights_i * scale ≈ 0, phân phối Dirichlet trở nên cực kỳ không ổn định
+    (mật độ dồn vào biên simplex, entropy nổ về -∞, log_prob biến động dữ dội
+    giữa 2 lần forward gần như giống nhau) -> ratio=exp(new-old) lệch lớn ->
+    approx_kl ~5, clip_frac ~0.94 dù policy chưa học gì nhiều.
+
+    Thay vì cộng eps tuyệt đối (quá nhỏ, không cứu được), ta TRỘN weights với
+    phân phối ĐỀU (uniform smoothing trên simplex): mỗi thành phần được kéo về
+    tối thiểu `floor` phần của khối lượng đều. Nhờ vậy mọi concentration_i >=
+    floor/n * scale > 0 đủ lớn, Dirichlet ổn định, mean vẫn ≈ weights (chỉ
+    smoothing nhẹ). Đây là kỹ thuật chuẩn (giống label smoothing) và giữ
+    nguyên API `(weights, value)` của policy.
+    """
+    w = weights.clamp_min(0.0)
+    w = w / w.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    n = w.shape[-1]
+    # Trộn: (1 - floor) * w + floor * uniform. floor=0.02 -> mỗi thành phần có
+    # tối thiểu ~0.02/n khối lượng, đủ để concentration không gần 0.
+    w_smoothed = (1.0 - floor) * w + floor / n
+    concentration = w_smoothed * concentration_scale
     return torch.distributions.Dirichlet(concentration)
 
 

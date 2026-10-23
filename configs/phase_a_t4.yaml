@@ -46,9 +46,9 @@ model:
 
 training:
   n_steps: 256                   # (T4) giảm từ 512 -> rollout nhanh gấp đôi
-  n_epochs: 4
+  n_epochs: 2                     # (T4) giảm từ 4 -> update() nhanh gấp đôi; KL early-stop thường dừng sớm anyway
   batch_size: 64
-  lr: 1.0e-5
+  lr: 3.0e-6                      # giảm từ 1e-5: reward đã scale x100 nên gradient lớn hơn, cần lr nhỏ hơn
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2
@@ -57,7 +57,7 @@ training:
   gradient_checkpointing: false  # (T4) tắt -> nhanh hơn ~30-40%, T4 16GB dư VRAM
   save_every: 10
   # --- Ổn định PPO (fix approx_kl/clip_frac cao) ---
-  dirichlet_concentration_scale: 10.0
+  dirichlet_concentration_scale: 20.0  # tăng từ 10 -> vùng entropy ổn định nhất (đo thực nghiệm)
   entropy_coef: 0.01
   target_kl: 0.05
 

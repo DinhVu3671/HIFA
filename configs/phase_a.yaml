@@ -36,9 +36,9 @@ model:
 
 training:
   n_steps: 512
-  n_epochs: 4
+  n_epochs: 2
   batch_size: 64
-  lr: 1.0e-5
+  lr: 3.0e-6                            # giảm từ 1e-5: reward đã scale x100 nên gradient lớn hơn, cần lr nhỏ hơn
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2
@@ -47,7 +47,7 @@ training:
   gradient_checkpointing: true
   save_every: 10   # lưu checkpoint resume mỗi 10 update (~13 phút) — chống mất tiến độ khi Colab ngắt
   # --- Ổn định PPO (fix approx_kl/clip_frac cao) ---
-  dirichlet_concentration_scale: 10.0  # giảm từ 50 -> log_prob bớt nhạy, ratio ổn định hơn
+  dirichlet_concentration_scale: 20.0  # vùng entropy ổn định nhất (đo thực nghiệm); kết hợp uniform smoothing trong _weights_to_dirichlet
   entropy_coef: 0.01                   # hệ số entropy bonus (khuyến khích exploration)
   target_kl: 0.05                      # KL early-stop: dừng epoch khi policy trôi quá xa (null = tắt)
 
