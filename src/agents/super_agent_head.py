@@ -230,6 +230,13 @@ class PortfolioPolicyLLM(nn.Module):
                 # định — cần gán để `padding=True` trong forward() không lỗi.
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             backbone = AutoModel.from_pretrained(base_model_name, torch_dtype=torch_dtype)
+            # Đưa backbone lên GPU TRƯỚC khi wrap LoRA — an toàn hơn gọi
+            # `self.to(device)` trên PeftModel (một số phiên bản peft/torch xử
+            # lý `.to()` trên toàn PeftModel không nhất quán). Không nuốt lỗi:
+            # nếu CUDA báo available mà đây lỗi, ta muốn biết ngay chứ KHÔNG
+            # âm thầm rớt về CPU (chạy chậm gấp ~10 lần suốt nhiều giờ).
+            if not self._is_test_backbone and self.device.type == "cuda":
+                backbone = backbone.to(self.device)
 
         if use_lora:
             if LoraConfig is None or get_peft_model is None:
@@ -257,18 +264,35 @@ class PortfolioPolicyLLM(nn.Module):
         # BẮT BUỘC có value_head cho PPO — bản thiết kế trước thiếu baseline này.
         self.value_head = nn.Linear(hidden_size, 1)
 
-        # Chuyển toàn bộ (backbone + head) lên device đã chọn. Chỉ chuyển ở
-        # path production thật — backbone giả cho unit test giữ nguyên trên CPU
-        # (tránh yêu cầu CUDA trong CI). Bọc try/except để không crash nếu môi
-        # trường thiếu CUDA runtime dù `is_available()` báo True.
-        if not self._is_test_backbone and self.device.type != "cpu":
-            try:
-                self.to(self.device)
-            except Exception as exc:  # noqa: BLE001
-                warnings.warn(
-                    f"Không chuyển được model lên {self.device} ({exc}); giữ trên CPU."
+        # Chuyển toàn bộ (backbone đã lên GPU ở trên + 2 head float32) lên
+        # device đã chọn. Backbone giả (unit test) giữ nguyên trên CPU.
+        #
+        # KHÔNG nuốt lỗi device nữa: bản cũ bọc try/except rồi âm thầm rớt về
+        # CPU — hệ quả là model chạy CPU chậm gấp ~10 lần suốt nhiều giờ mà
+        # người dùng không hề biết (warning bị chôn trong log). Nếu CUDA báo
+        # available mà không đưa model lên GPU được, ta RAISE để dừng ngay.
+        if not self._is_test_backbone and self.device.type == "cuda":
+            # Backbone đã được .to('cuda') TRƯỚC khi wrap LoRA (ở trên); LoRA
+            # adapter được peft tạo trên cùng device với backbone. Chỉ còn 2
+            # head float32 cần đưa lên GPU riêng — tránh gọi .to() trên toàn
+            # PeftModel wrapper (nguồn gây lỗi device trong bản cũ).
+            self.policy_head = self.policy_head.to(self.device)
+            self.value_head = self.value_head.to(self.device)
+            # Phòng hờ: ép mọi param còn sót trên CPU (vd. LoRA) lên GPU.
+            self.to(self.device)
+            # Xác minh THẬT params đã nằm trên GPU (không tin suông is_available).
+            actual = next(self.parameters()).device
+            if actual.type != "cuda":
+                raise RuntimeError(
+                    f"torch.cuda.is_available()=True nhưng model vẫn ở {actual} "
+                    "sau khi .to('cuda'). Training trên CPU sẽ chậm gấp ~10 lần — "
+                    "dừng để bạn kiểm tra runtime GPU của Colab (Runtime → Change "
+                    "runtime type → GPU) thay vì âm thầm chạy CPU."
                 )
-                self.device = torch.device("cpu")
+            print(f"[PortfolioPolicyLLM] Model đã lên GPU: {torch.cuda.get_device_name(0)} ({actual}).")
+        elif not self._is_test_backbone:
+            print(f"[PortfolioPolicyLLM] Chạy trên CPU (device={self.device}) — "
+                  "CẢNH BÁO: training LLM trên CPU rất chậm.")
 
     # ------------------------------------------------------------------
     def _get_device(self) -> torch.device:

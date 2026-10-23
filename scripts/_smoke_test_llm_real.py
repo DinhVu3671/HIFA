@@ -48,15 +48,22 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 1) Load policy voi model THAT
     # ------------------------------------------------------------------
-    log("Dang khoi tao PortfolioPolicyLLM voi Qwen/Qwen2.5-1.5B-Instruct ...")
+    has_cuda = torch.cuda.is_available()
+    log(f"torch.cuda.is_available()={has_cuda}"
+        + (f" | GPU={torch.cuda.get_device_name(0)}" if has_cuda else ""))
+    # Trên GPU dùng bf16 (nhanh, tiết kiệm VRAM); trên CPU dùng float32 vì
+    # bf16 matmul rất chậm trên CPU.
+    dtype = torch.bfloat16 if has_cuda else torch.float32
+    log(f"Dang khoi tao PortfolioPolicyLLM voi Qwen/Qwen2.5-1.5B-Instruct (dtype={dtype}) ...")
     t0 = time.perf_counter()
     policy = PortfolioPolicyLLM(
         base_model_name="Qwen/Qwen2.5-1.5B-Instruct",
         n_assets=len(TICKERS),
-        torch_dtype=torch.float32,  # xem ghi chu trong bao cao: bf16 matmul rat cham tren CPU
+        torch_dtype=dtype,
     )
     t_init = time.perf_counter() - t0
-    log(f"Khoi tao policy xong trong {t_init:.1f}s")
+    policy_device = next(policy.parameters()).device
+    log(f"Khoi tao policy xong trong {t_init:.1f}s | policy device = {policy_device}")
 
     n_trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in policy.parameters())
@@ -148,7 +155,7 @@ def main() -> None:
 
     total_elapsed = time.perf_counter() - total_t0
     log("=" * 70)
-    log("TOM TAT THOI GIAN THAT (CPU 12-core, khong GPU):")
+    log(f"TOM TAT THOI GIAN THAT (device = {policy_device}):")
     log(f"  - Khoi tao policy (tokenizer+model+LoRA, KHONG tinh download lan dau): {t_init:.1f}s")
     log(f"  - forward() 1 prompt don le: {t_fwd:.2f}s")
     log(f"  - collect_rollout(n_steps={N_STEPS}): {t_rollout:.2f}s => {t_rollout / N_STEPS:.2f}s/step")
