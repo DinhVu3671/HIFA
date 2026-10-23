@@ -1,0 +1,74 @@
+phase: A
+
+# ===========================================================================
+# BIẾN THỂ TỐI ƯU CHO GPU T4 (Kaggle / Colab free) — nhẹ hơn phase_a.yaml
+# (vốn chỉnh cho A100). Giảm tải để train khả thi về thời gian trên T4:
+#   - gradient_checkpointing: false  (T4 16GB dư VRAM cho Qwen1.5B+LoRA ~4GB,
+#     tắt checkpointing -> forward/backward nhanh hơn ~30-40%)
+#   - n_steps: 512 -> 256            (rollout nhanh gấp đôi, vẫn đủ cho PPO)
+#   - max_prompt_length: 512 -> 256  (prompt 8 mã chỉ ~150-200 token, 256 thừa đủ)
+# Mọi thay đổi còn lại (reward, PPO stability, resume) GIỮ NGUYÊN như phase_a.yaml.
+# Dùng config này trên Kaggle/T4; dùng phase_a.yaml khi có A100.
+# ===========================================================================
+
+data:
+  market: "US"
+  source: "yfinance"
+  tickers: ["AAPL", "MSFT", "JPM", "JNJ", "XOM", "PG", "KO", "NVDA"]
+  start_date: "2015-01-01"
+  end_date: "2025-12-31"
+  raw_ohlcv_path: "data/raw/ohlcv/phase_0.parquet"
+  processed_path: "data/processed/phase_0.parquet"
+  walk_forward:
+    train_range: ["2019-01-01", "2022-12-31"]
+    val_range: ["2023-01-01", "2023-06-30"]
+    test_range: ["2023-07-01", "2023-12-31"]
+
+env:
+  initial_cash: 1_000_000        # USD
+  transaction_cost: 0.0005       # 0.05%/lệnh (broker Mỹ)
+  price_limit: null              # Mỹ không có biên độ giá
+  max_weight: 0.30               # trần 30%/mã (De-Cuong §6.2)
+  reward:
+    alpha: 0.5
+    beta: 0.3
+    gamma: 0.2
+    window: 20
+
+model:
+  base_model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+  max_prompt_length: 256         # (T4) giảm từ 512 -> tokenize + forward nhanh hơn
+
+training:
+  n_steps: 256                   # (T4) giảm từ 512 -> rollout nhanh gấp đôi
+  n_epochs: 4
+  batch_size: 64
+  lr: 1.0e-5
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  total_updates: 200
+  seeds: [0, 1, 2, 3, 4]
+  gradient_checkpointing: false  # (T4) tắt -> nhanh hơn ~30-40%, T4 16GB dư VRAM
+  save_every: 10
+  # --- Ổn định PPO (fix approx_kl/clip_frac cao) ---
+  dirichlet_concentration_scale: 10.0
+  entropy_coef: 0.01
+  target_kl: 0.05
+
+baselines:
+  b4_ppo_no_llm:
+    total_timesteps: 200_000
+
+logging:
+  wandb_project: "hifa-phase-a"
+  tensorboard_dir: "./logs"
+
+evaluation:
+  n_seeds: 5
+  output_dir: "reports/phase_a"
