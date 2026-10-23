@@ -396,11 +396,35 @@ class SimplePPOTrainer:
         }
 
         # policy.train() để LoRA + 2 head nhận gradient, NHƯNG tắt Dropout để
-        # log_prob mới nhất quán với log_prob cũ (tính lúc rollout dưới eval()).
-        # Đây là fix chính cho approx_kl/clip_frac cao bất thường.
+        # log_prob mới nhất quán với log_prob cũ.
         self.policy.train()
         _set_dropout_eval(self.policy)
         trainable_params = [p for p in self.policy.parameters() if p.requires_grad]
+
+        # FIX approx_kl cao do BF16: log_prob "cũ" lưu từ collect_rollout được
+        # tính dưới policy.eval() + đường bf16 KHÁC với forward trong update()
+        # (train mode, có gradient). Với bf16, cùng input nhưng 2 đường tính cho
+        # weights lệch nhẹ -> Dirichlet.log_prob (nhạy) lệch vài đơn vị ->
+        # ratio=exp(new-old) sai -> approx_kl ~5 dù policy CHƯA học gì. (Kiểm
+        # chứng: với backbone float32 tất định, KL ở forward đầu = 0.000000.)
+        #
+        # Khắc phục chuẩn: TÍNH LẠI old_log_prob bằng CHÍNH forward đầu tiên của
+        # update() (no_grad), rồi dùng nó làm mốc "policy cũ". Nhờ vậy ratio ở
+        # minibatch đầu epoch đầu = 1 chính xác (KL=0), loại bỏ nhiễu bf16 giữa
+        # 2 pha. Đây là biến thể hợp lệ của PPO (old_logprob = policy tại đầu
+        # update, trước mọi optimizer.step()). KHÔNG dùng old_log_probs lưu từ
+        # rollout nữa — nó chỉ còn để log/debug.
+        recomputed_old_lp: Dict[int, torch.Tensor] = {}
+        with torch.no_grad():
+            for start in range(0, T, batch_size):
+                idx_r = list(range(start, min(start + batch_size, T)))
+                w_r, _ = self.policy([prompts[i] for i in idx_r])
+                dist_r = _weights_to_dirichlet(w_r, self.dirichlet_concentration_scale)
+                act_r = old_actions[start : start + batch_size].to(w_r.device)
+                lp_r = dist_r.log_prob(act_r).detach()
+                for j, i in enumerate(idx_r):
+                    recomputed_old_lp[i] = lp_r[j]
+        old_log_probs = torch.stack([recomputed_old_lp[i] for i in range(T)]).to(advantages.device)
 
         for _epoch in range(n_epochs):
             epoch_kls: List[float] = []
