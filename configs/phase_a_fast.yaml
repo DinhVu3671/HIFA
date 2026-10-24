@@ -54,14 +54,14 @@ model:
 training:
   n_steps: 512
   n_epochs: 1                    # (TỐC ĐỘ) 2->1: cắt nửa thời gian update()
-  batch_size: 64
+  batch_size: 32                 # (VRAM) 64->32: tránh CUDA OOM trên 16GB khi update() giữ activation batch lớn
   lr: 3.0e-6                     # GIỮ NGUYÊN (ổn định)
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2                  # GIỮ NGUYÊN (ổn định)
   total_updates: 200
   seeds: [0, 1, 2, 3, 4]
-  gradient_checkpointing: false  # (TỐC ĐỘ) 16GB dư VRAM -> tắt, nhanh ~30-40%, không đổi kết quả
+  gradient_checkpointing: true   # (VRAM) BẬT LẠI: tắt gây CUDA OOM trên 16GB (update batch=32 vẫn vượt VRAM nếu giữ toàn bộ activation). Checkpointing đổi tốc độ lấy VRAM — cần thiết ở đây.
   save_every: 10
   dirichlet_concentration_scale: 12.0  # GIỮ NGUYÊN (ổn định — đã probe)
   entropy_coef: 0.01
