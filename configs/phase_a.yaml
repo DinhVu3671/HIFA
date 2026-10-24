@@ -27,6 +27,10 @@ env:
 
 model:
   base_model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  # float32 cho PPO ổn định: bf16 làm Dirichlet.log_prob lệch giữa pha collect
+  # và update -> approx_kl/clip_frac nổ ngay update đầu (xem ppo_trainer.update).
+  # Qwen-1.5B + LoRA fp32 ~7GB VRAM, GPU >= 10GB chạy thoải mái (RTX 5060 Ti 16GB OK).
+  torch_dtype: "float32"
   lora:
     r: 16
     alpha: 32

@@ -293,6 +293,25 @@ def run_one_seed(cfg: Dict[str, Any], seed: int, smoke_test: bool, resume: bool 
 
     model_cfg = cfg["model"]
     lora_cfg = model_cfg.get("lora", {})
+
+    # dtype của backbone — đọc từ config `model.torch_dtype` (mặc định bf16 để
+    # giữ nguyên hành vi cũ). QUAN TRỌNG: bf16 làm log_prob của Dirichlet lệch
+    # nhẹ giữa pha collect (no_grad) và pha update (có grad) -> approx_kl nổ
+    # (~4), clip_frac ~0.9 NGAY update đầu dù policy chưa học (xem comment trong
+    # ppo_trainer.update()). Trên GPU >= ~10GB VRAM nên đặt "float32" cho
+    # Qwen-1.5B + LoRA (~7GB) để PPO ổn định. T4/VRAM nhỏ mới cần bf16/fp16.
+    _dtype_map = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+    }
+    _dtype_str = str(model_cfg.get("torch_dtype", "bfloat16")).lower()
+    torch_dtype = _dtype_map.get(_dtype_str, torch.bfloat16)
+    logger.info("Backbone torch_dtype = %s (từ config '%s')", torch_dtype, _dtype_str)
+
     policy = PortfolioPolicyLLM(
         base_model_name=model_cfg["base_model_name"],
         n_assets=len(tickers),
@@ -301,6 +320,7 @@ def run_one_seed(cfg: Dict[str, Any], seed: int, smoke_test: bool, resume: bool 
         lora_dropout=lora_cfg.get("dropout", 0.05),
         lora_target_modules=lora_cfg.get("target_modules", ["q_proj", "v_proj", "k_proj", "o_proj"]),
         max_prompt_length=model_cfg.get("max_prompt_length", 512),
+        torch_dtype=torch_dtype,
     )
 
     # Yêu cầu bắt buộc mục 3.6: confirm số tham số trainable rất nhỏ (chỉ
