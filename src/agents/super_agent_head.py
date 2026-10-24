@@ -358,7 +358,25 @@ class PortfolioPolicyLLM(nn.Module):
         device = self._get_device()
         inputs = {k: v.to(device) for k, v in inputs.items()}
         outputs = self.backbone(**inputs)
-        last_hidden = outputs.last_hidden_state[:, -1, :]  # hidden state token cuối cùng
+        # BUG FIX (PPO KL nổ với batch > 1): KHÔNG dùng [:, -1, :] — với
+        # padding=True và Qwen pad BÊN PHẢI, vị trí -1 của các prompt ngắn hơn
+        # prompt dài nhất trong batch là TOKEN PAD (hidden vô nghĩa). Vì lượng
+        # pad phụ thuộc thành phần batch, cùng 1 prompt ở 2 batch khác nhau cho
+        # ra hidden khác nhau -> weights khác -> log_prob khác -> ratio != 1 ->
+        # approx_kl ~2.5, clip_frac ~0.83 ngay update đầu dù policy chưa học.
+        # Cách đúng: lấy hidden state của TOKEN THẬT CUỐI CÙNG mỗi prompt qua
+        # attention_mask (bất biến với padding/thành phần batch).
+        hidden_states = outputs.last_hidden_state  # (batch, seq_len, hidden)
+        attn_mask = inputs.get("attention_mask")
+        if attn_mask is not None:
+            # index token thật cuối = số token thật - 1 (mask: 1=thật, 0=pad)
+            last_idx = attn_mask.sum(dim=1) - 1  # (batch,)
+            last_idx = last_idx.clamp_min(0).long()
+            batch_idx = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+            last_hidden = hidden_states[batch_idx, last_idx, :]
+        else:
+            # Không có mask (vd. backbone test) -> fallback token cuối tensor.
+            last_hidden = hidden_states[:, -1, :]
         # policy_head/value_head là nn.Linear float32 (mặc định), trong khi
         # backbone có thể chạy ở bfloat16 (torch_dtype) — ép về float32 trước
         # khi vào head để tránh lệch dtype khi nhân ma trận (heads rất nhỏ,
