@@ -1,0 +1,80 @@
+phase: A
+
+# ===========================================================================
+# BIẾN THỂ TĂNG TỐC của phase_a.yaml — cho GPU >= 16GB VRAM (vd RTX 5060 Ti).
+# GIỮ NGUYÊN mọi tham số ảnh hưởng ĐỘ ỔN ĐỊNH PPO (scale=12, lr, clip_eps,
+# target_kl) và fix bug padding trong super_agent_head.forward(). Chỉ đổi các
+# tham số TỐC ĐỘ, không đổi tính đúng đắn:
+#   - gradient_checkpointing: true -> false  (16GB dư VRAM; bỏ recompute
+#     activation khi backward -> nhanh hơn ~30-40%, KHÔNG đổi kết quả học)
+#   - torch_dtype: float32 -> bfloat16        (RTX 5060 Ti chạy bf16 nhanh ~1.5-2x;
+#     KL nổ trước đây là do bug padding (đã fix), KHÔNG phải dtype -> bf16 giờ an toàn)
+#   - n_epochs: 2 -> 1                         (cắt một nửa thời gian update(); PPO
+#     1 epoch vẫn học, kém sample-efficiency chút -> bù bằng total_updates nếu cần)
+#   - max_prompt_length: 512 -> 256            (prompt 8 mã ~150-200 token, 256 thừa đủ)
+# QUAN TRỌNG: PHẢI probe 3 update với config này (total_updates tạm = 3, n_steps
+# GIỮ 512) để xác nhận approx_kl vẫn < 0.1 TRƯỚC khi train 5 seed. Nếu bf16 làm
+# KL tăng trở lại (dù đã fix padding), đổi torch_dtype về "float32".
+# ===========================================================================
+
+data:
+  market: "US"
+  source: "yfinance"
+  tickers: ["AAPL", "MSFT", "JPM", "JNJ", "XOM", "PG", "KO", "NVDA"]
+  start_date: "2015-01-01"
+  end_date: "2025-12-31"
+  raw_ohlcv_path: "data/raw/ohlcv/phase_0.parquet"
+  processed_path: "data/processed/phase_0.parquet"
+  walk_forward:
+    train_range: ["2019-01-01", "2022-12-31"]
+    val_range: ["2023-01-01", "2023-06-30"]
+    test_range: ["2023-07-01", "2023-12-31"]
+
+env:
+  initial_cash: 1_000_000
+  transaction_cost: 0.0005
+  price_limit: null
+  max_weight: 0.30
+  reward:
+    alpha: 0.5
+    beta: 0.3
+    gamma: 0.2
+    window: 20
+
+model:
+  base_model_name: "Qwen/Qwen2.5-1.5B-Instruct"
+  torch_dtype: "bfloat16"        # (TỐC ĐỘ) bf16 nhanh ~1.5-2x; KL nổ cũ do bug padding đã fix, không phải dtype
+  lora:
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+  max_prompt_length: 256         # (TỐC ĐỘ) prompt 8 mã ~150-200 token, 256 thừa đủ
+
+training:
+  n_steps: 512
+  n_epochs: 1                    # (TỐC ĐỘ) 2->1: cắt nửa thời gian update()
+  batch_size: 64
+  lr: 3.0e-6                     # GIỮ NGUYÊN (ổn định)
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2                  # GIỮ NGUYÊN (ổn định)
+  total_updates: 200
+  seeds: [0, 1, 2, 3, 4]
+  gradient_checkpointing: false  # (TỐC ĐỘ) 16GB dư VRAM -> tắt, nhanh ~30-40%, không đổi kết quả
+  save_every: 10
+  dirichlet_concentration_scale: 12.0  # GIỮ NGUYÊN (ổn định — đã probe)
+  entropy_coef: 0.01
+  target_kl: 0.05                # GIỮ NGUYÊN (ổn định)
+
+baselines:
+  b4_ppo_no_llm:
+    total_timesteps: 200_000
+
+logging:
+  wandb_project: "hifa-phase-a"
+  tensorboard_dir: "./logs"
+
+evaluation:
+  n_seeds: 5
+  output_dir: "reports/phase_a"
