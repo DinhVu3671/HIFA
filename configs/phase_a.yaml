@@ -51,7 +51,7 @@ training:
   gradient_checkpointing: true
   save_every: 10   # lưu checkpoint resume mỗi 10 update (~13 phút) — chống mất tiến độ khi Colab ngắt
   # --- Ổn định PPO (fix approx_kl/clip_frac cao) ---
-  dirichlet_concentration_scale: 20.0  # vùng entropy ổn định nhất (đo thực nghiệm); kết hợp uniform smoothing trong _weights_to_dirichlet
+  dirichlet_concentration_scale: 12.0  # ĐÃ SỬA từ 20.0: scale=20 làm Dirichlet nhọn -> approx_kl~3.8, clip_frac~0.87 (PPO nổ) ngay update đầu. Probe thật trên RTX 5060 Ti: scale=12 cho approx_kl~0.02, clip_frac 0.03-0.055 (lành mạnh, policy có cập nhật). Xem _weights_to_dirichlet.
   entropy_coef: 0.01                   # hệ số entropy bonus (khuyến khích exploration)
   target_kl: 0.05                      # KL early-stop: dừng epoch khi policy trôi quá xa (null = tắt)
 
